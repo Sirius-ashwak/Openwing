@@ -25,3 +25,9 @@ yarn-error.log*
 dist/
 build/
 .DS_Store
+
+# IDEs/AI
+CLAUDE.md
+.claude/
+.vscode/
+.idea/
