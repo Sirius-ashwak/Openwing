@@ -1,207 +1,511 @@
-import os
-import json
+"""Openwing Janus FastAPI server.
+
+Real endpoints:
+  POST   /api/runs                  — create and start a scan
+  GET    /api/runs                  — list recent runs
+  GET    /api/runs/{id}             — single run status + result
+  GET    /api/runs/{id}/events      — SSE live trace stream
+  GET    /api/runs/{id}/findings    — structured findings for a run
+  DELETE /api/runs/{id}             — cancel / discard a run
+  GET    /api/health                — provider health check
+  GET    /api/system                — GPU / endpoint / budget status (env-driven)
+
+The frontend is served from ./frontend via StaticFiles mount.
+"""
+from __future__ import annotations
+
 import asyncio
-from fastapi import FastAPI, HTTPException, Request
+import json
+import logging
+import os
+import time
+from pathlib import Path
+from typing import Any
+
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
-from typing import List, Optional, Any
+from pydantic import BaseModel, Field, field_validator
 
-app = FastAPI(title="Openwing Janus API", version="0.4.1-rc")
+from janus.discovery import iter_python_files
+from janus.github_fetcher import GitHubURLError, cleanup_clone, clone_repo, is_github_url
+from janus.graph import JanusResult, run_janus_on_file
+from janus.llm import check_provider_health, load_llm_config
+from janus.run_store import RunRecord, store
 
-# ── Mock Data ─────────────────────────────────────────────────────────────
+logger = logging.getLogger(__name__)
 
-MOCK_REPO = {
-    "url": "github.com/openwing-labs/vuln-flask-app",
-    "name": "vuln-flask-app",
-    "owner": "openwing-labs",
-    "branch": "main",
-    "commit": "a4c91f2",
-    "language": "Python",
-    "files": 47,
-    "loc": 2814,
-    "size": "1.2 MB",
-}
+# ── App setup ─────────────────────────────────────────────────────────────
 
-MOCK_FILETREE = [
-    {"path": "app/__init__.py", "loc": 22, "status": "clean"},
-    {"path": "app/auth.py", "loc": 84, "status": "clean"},
-    {"path": "app/db.py", "loc": 56, "status": "flagged"},
-    {"path": "app/routes/users.py", "loc": 142, "status": "critical"},
-    {"path": "app/routes/proxy.py", "loc": 98, "status": "critical"},
-    {"path": "app/routes/admin.py", "loc": 73, "status": "clean"},
-    {"path": "app/utils/sanitize.py", "loc": 31, "status": "clean"},
-    {"path": "app/templates/login.html", "loc": 18, "status": "clean"},
-    {"path": "config.py", "loc": 26, "status": "flagged"},
-    {"path": "requirements.txt", "loc": 12, "status": "clean"},
-    {"path": "tests/test_users.py", "loc": 64, "status": "clean"},
-]
+app = FastAPI(
+    title="Openwing Janus API",
+    version="0.5.0",
+    description="Red/Blue adversarial security pipeline",
+)
 
-MOCK_SWEEP = [
-    {"path": "app/routes/users.py", "loc": 142, "agent": "red", "state": "critical", "findings": 1, "time": 5800},
-    {"path": "app/routes/proxy.py", "loc": 98, "agent": "red", "state": "critical", "findings": 1, "time": 7200},
-    {"path": "app/routes/admin.py", "loc": 73, "agent": "red", "state": "clean", "findings": 0, "time": 4100},
-    {"path": "app/auth.py", "loc": 84, "agent": "red", "state": "clean", "findings": 0, "time": 3900},
-    {"path": "app/db.py", "loc": 56, "agent": "red", "state": "clean", "findings": 0, "time": 3200},
-    {"path": "app/utils/sanitize.py", "loc": 31, "agent": "red", "state": "clean", "findings": 0, "time": 2400},
-    {"path": "app/templates/login.html", "loc": 18, "agent": "red", "state": "clean", "findings": 0, "time": 1900},
-    {"path": "config.py", "loc": 26, "agent": "red", "state": "fp", "findings": 1, "time": 4600},
-]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],            # tighten for production
+    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+    allow_headers=["*"],
+)
 
-MOCK_FINDINGS = [
-    {
-        "id": "JNS-001",
-        "title": "SQL Injection via unsanitized search query",
-        "severity": "critical", "cvss": 9.1, "cwe": "CWE-89",
-        "file": "app/routes/users.py", "line": 14, "function": "search_users",
-        "vector": "AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
-        "description": "The /api/users/search endpoint interpolates the user-controlled `q` parameter directly into a SQL statement using an f-string, with no parameterization or escaping. An attacker can break out of the LIKE clause and chain a UNION query to exfiltrate arbitrary tables — including password hashes from the users table.",
-        "impact": ["Full read access to the application database", "Disclosure of all user credentials (bcrypt hashes)", "Potential write/delete via stacked queries depending on driver"],
-        "discoveredAt": 5950, "patchedAt": 10550, "verifiedAt": 14000,
-        "vulnCode": "from flask import Blueprint, request, jsonify\nfrom app.db import get_conn\n\nbp = Blueprint(\"users\", __name__)\n\n@bp.route(\"/api/users/search\")\ndef search_users():\n    \"\"\"Search users by username substring.\"\"\"\n    q = request.args.get(\"q\", \"\")\n    conn = get_conn()\n    cur = conn.cursor()\n\n    # FIXME: refactor before launch — direct interpolation\n    sql = f\"SELECT id, username, email FROM users WHERE username LIKE '%{q}%'\"\n    cur.execute(sql)\n\n    rows = cur.fetchall()\n    return jsonify([dict(r) for r in rows])",
-        "patchedCode": "from flask import Blueprint, request, jsonify\nfrom app.db import get_conn\n\nbp = Blueprint(\"users\", __name__)\n\n@bp.route(\"/api/users/search\")\ndef search_users():\n    \"\"\"Search users by username substring.\"\"\"\n    q = request.args.get(\"q\", \"\")\n    if len(q) > 64:\n        return jsonify({\"error\": \"query too long\"}), 400\n\n    conn = get_conn()\n    cur = conn.cursor()\n\n    # Parameterized query — driver handles escaping\n    sql = \"SELECT id, username, email FROM users WHERE username LIKE ?\"\n    cur.execute(sql, (f\"%{q}%\",))\n\n    rows = cur.fetchall()\n    return jsonify([dict(r) for r in rows])",
-        "poc": "#!/usr/bin/env python3\n\"\"\"\nPoC: SQL Injection in /api/users/search\n\"\"\"\nimport requests, json\n\nTARGET = \"http://localhost:5000\"\nPAYLOAD = \"' UNION SELECT id,username,password_hash FROM users-- \"\n\ndef run():\n    r = requests.get(f\"{TARGET}/api/users/search\",\n                     params={\"q\": PAYLOAD})\n    rows = r.json()\n    print(f\"[+] Extracted {len(rows)} rows\")\n    for row in rows[:5]:\n        print(f\"    {row}\")\n\nif __name__ == \"__main__\":\n    run()",
-    },
-    {
-        "id": "JNS-002",
-        "title": "Server-Side Request Forgery in proxy endpoint",
-        "severity": "critical", "cvss": 8.6, "cwe": "CWE-918",
-        "file": "app/routes/proxy.py", "line": 11, "function": "fetch",
-        "vector": "AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:L/A:N",
-        "description": "The /api/fetch endpoint takes a user-supplied URL and issues a server-side HTTP request without validating the scheme or destination host. An attacker can pivot through the application server to access internal services and the cloud metadata endpoint, exfiltrating IAM credentials.",
-        "impact": ["Read access to internal-only HTTP services", "Disclosure of cloud IAM credentials via metadata endpoint", "Reconnaissance of internal network topology"],
-        "discoveredAt": 7250, "patchedAt": 12550, "verifiedAt": 15000,
-        "vulnCode": "from flask import Blueprint, request, Response\nimport requests\n\nbp = Blueprint(\"proxy\", __name__)\n\n@bp.route(\"/api/fetch\")\ndef fetch():\n    \"\"\"Fetch and return content from a remote URL.\"\"\"\n    url = request.args.get(\"url\")\n    if not url:\n        return {\"error\": \"url required\"}, 400\n\n    # FIXME: validate url scheme + host before fetching\n    resp = requests.get(url, timeout=5)\n    return Response(resp.content,\n                    content_type=resp.headers.get(\"content-type\"))",
-        "patchedCode": "from flask import Blueprint, request, Response\nfrom urllib.parse import urlparse\nimport ipaddress, socket, requests\n\nbp = Blueprint(\"proxy\", __name__)\n\nALLOWED_SCHEMES = {\"http\", \"https\"}\nDENIED_HOSTS = {\"localhost\", \"metadata.google.internal\"}\n\ndef _is_safe(url: str) -> bool:\n    p = urlparse(url)\n    if p.scheme not in ALLOWED_SCHEMES: return False\n    host = p.hostname or \"\"\n    if host in DENIED_HOSTS: return False\n    try:\n        ip = ipaddress.ip_address(socket.gethostbyname(host))\n        if ip.is_private or ip.is_loopback or ip.is_link_local:\n            return False\n    except (socket.gaierror, ValueError):\n        return False\n    return True\n\n@bp.route(\"/api/fetch\")\ndef fetch():\n    url = request.args.get(\"url\")\n    if not url or not _is_safe(url):\n        return {\"error\": \"invalid url\"}, 400\n\n    resp = requests.get(url, timeout=5, allow_redirects=False)\n    return Response(resp.content,\n                    content_type=resp.headers.get(\"content-type\"))",
-        "poc": "#!/usr/bin/env python3\n\"\"\"\nPoC: SSRF in /api/fetch\n\"\"\"\nimport requests\n\nTARGET = \"http://localhost:5000\"\nMETADATA = \"http://169.254.169.254/latest/meta-data/iam/security-credentials/\"\n\ndef run():\n    r = requests.get(f\"{TARGET}/api/fetch\",\n                     params={\"url\": METADATA})\n    print(\"[+] Cloud metadata response:\")\n    print(r.text[:300])\n\nif __name__ == \"__main__\":\n    run()",
-    },
-    {
-        "id": "JNS-003",
-        "title": "Insecure default for DEBUG flag",
-        "severity": "info", "cvss": 0.0, "cwe": "CWE-1188",
-        "file": "config.py", "line": 8, "function": "<module>",
-        "vector": "AV:L/AC:H/PR:H/UI:N/S:U/C:N/I:N/A:N",
-        "description": "The DEBUG configuration falls back to True if the DEBUG env var is unset. Janus_Red reviewed the deploy pipeline and found that the production Dockerfile explicitly sets DEBUG=False, so this is reachable only in misconfigured environments.",
-        "impact": ["Stack traces shown to end users in error pages (only if env unset)"],
-        "discoveredAt": 7700, "patchedAt": None, "verifiedAt": None,
-        "triage": "false-positive",
-        "vulnCode": "DEBUG = os.getenv(\"DEBUG\", True)\n", "patchedCode": None, "poc": None,
-    },
-]
 
-MOCK_TRACE = [
-  {"agent": "system", "t": 0,    "line": "── bootstrapping CrewAI orchestrator ──"},
-  {"agent": "system", "t": 220,  "line": "spawning vLLM endpoint @ rocm0:8000 · Qwen3.5-9B · ctx=256k"},
-  {"agent": "system", "t": 580,  "line": "roles: Janus_Red [offense] · Janus_Blue [defense]"},
-  {"agent": "system", "t": 820,  "line": "cloning github.com/openwing-labs/vuln-flask-app @ a4c91f2"},
-  {"agent": "red",    "t": 1100, "line": "OK. Ingesting 47 files · 2,814 LOC."},
-  {"agent": "red",    "t": 1450, "line": "Flask app. Looking for: input → execution sinks."},
-  {"agent": "red",    "t": 1900, "line": "Tracing request.args / request.form / request.json across routes/*"},
-  {"agent": "red",    "t": 2400, "line": "→ app/routes/users.py:14 — request.args.get(\"q\") flows into SQL string."},
-  {"agent": "red",    "t": 2900, "line": "Sink uses f-string interpolation. No parameterization."},
-  {"agent": "red",    "t": 3300, "kind": "thought", "line": "Hypothesis: classical SQLi. Try UNION extract."},
-  {"agent": "red",    "t": 3700, "line": "Crafting payload …"},
-  {"agent": "red",    "t": 4100, "kind": "code", "line": "q = \"' UNION SELECT id,username,password_hash FROM users-- \""},
-  {"agent": "red",    "t": 4600, "line": "Spinning sandboxed Flask runtime → :5000"},
-  {"agent": "red",    "t": 5100, "kind": "shell", "line": "python poc_sqli.py"},
-  {"agent": "red",    "t": 5500, "kind": "output", "line": "[+] Extracted 142 rows"},
-  {"agent": "red",    "t": 5700, "kind": "output", "line": "    {'id': 1, 'username': 'alice', 'password_hash': '$2b$12$…'}"},
-  {"agent": "red",    "t": 5800, "kind": "output", "line": "    {'id': 2, 'username': 'bob',   'password_hash': '$2b$12$…'}"},
-  {"agent": "red",    "t": 5950, "line": "CONFIRMED — exfiltration possible. Writing finding JNS-001."},
-  {"agent": "red",    "t": 6100, "line": "→ app/routes/proxy.py:11 — request.args.get(\"url\") fed to requests.get()"},
-  {"agent": "red",    "t": 6300, "line": "No scheme/host validation. SSRF candidate."},
-  {"agent": "red",    "t": 6500, "kind": "thought", "line": "Try metadata endpoint pivot: 169.254.169.254"},
-  {"agent": "red",    "t": 6800, "kind": "shell", "line": "python poc_ssrf.py"},
-  {"agent": "red",    "t": 7100, "kind": "output", "line": "[+] Cloud metadata response: AccessKeyId=ASIA…"},
-  {"agent": "red",    "t": 7250, "line": "CONFIRMED — IAM credential exfiltration. Writing finding JNS-002."},
-  {"agent": "red",    "t": 7400, "line": "→ config.py:8 — DEBUG = os.getenv(\"DEBUG\", True)"},
-  {"agent": "red",    "t": 7700, "kind": "thought", "line": "Hard-coded default-true is a smell, but not exploitable in prod env. Marking as LOW / false-positive candidate."},
-  {"agent": "system", "t": 7900, "line": "↳ findings/ · JNS-001 (critical) · JNS-002 (critical) · JNS-003 (info)"},
-  {"agent": "system", "t": 8100, "line": "handoff → Janus_Blue · 2 patches required"},
-  {"agent": "blue",   "t": 8400, "line": "Received 2 findings. Reviewing JNS-001."},
-  {"agent": "blue",   "t": 8800, "line": "Vector: untrusted q in f-string. Standard fix: parameterize."},
-  {"agent": "blue",   "t": 9200, "kind": "thought", "line": "Need to preserve LIKE wildcard semantics. Build \"%\" + q + \"%\" as a parameter, not in SQL."},
-  {"agent": "blue",   "t": 9600, "line": "Adding length guard (64 chars) for pathological inputs."},
-  {"agent": "blue",   "t": 10000, "line": "Patch ready. Running test suite …"},
-  {"agent": "blue",   "t": 10400, "kind": "output", "line": "tests/test_users.py ........ 8 passed in 0.42s"},
-  {"agent": "blue",   "t": 10550, "line": "Patch applied to app/routes/users.py"},
-  {"agent": "blue",   "t": 10800, "line": "Reviewing JNS-002 (SSRF)."},
-  {"agent": "blue",   "t": 11100, "kind": "thought", "line": "Need allow-list of schemes + DNS resolution check + private/loopback IP block."},
-  {"agent": "blue",   "t": 11500, "line": "Drafting _is_safe() helper using urllib.parse + ipaddress + socket."},
-  {"agent": "blue",   "t": 12000, "line": "Disabling redirect-following (allow_redirects=False) to prevent bypass."},
-  {"agent": "blue",   "t": 12400, "kind": "output", "line": "tests/test_proxy.py ...... 6 passed in 0.28s"},
-  {"agent": "blue",   "t": 12550, "line": "Patch applied to app/routes/proxy.py"},
-  {"agent": "system", "t": 12750, "line": "verification loop · turn 2 → Janus_Red"},
-  {"agent": "red",    "t": 13000, "line": "Re-running PoC suite against patched build …"},
-  {"agent": "red",    "t": 13300, "kind": "shell", "line": "python poc_sqli.py"},
-  {"agent": "red",    "t": 13550, "kind": "output", "line": "[+] Extracted 0 rows"},
-  {"agent": "red",    "t": 13700, "line": "Trying bypass: payload-encoded LIKE wildcards …"},
-  {"agent": "red",    "t": 14000, "kind": "output", "line": "[+] Extracted 0 rows"},
-  {"agent": "red",    "t": 14200, "kind": "shell", "line": "python poc_ssrf.py"},
-  {"agent": "red",    "t": 14500, "kind": "output", "line": "[!] HTTP 400 — invalid url"},
-  {"agent": "red",    "t": 14700, "line": "Trying DNS rebinding: dns.evil.com → 169.254.169.254 …"},
-  {"agent": "red",    "t": 15000, "kind": "output", "line": "[!] HTTP 400 — invalid url"},
-  {"agent": "red",    "t": 15200, "line": "Both patches hold. Marking JNS-001 + JNS-002 as RESOLVED."},
-  {"agent": "system", "t": 15500, "line": "✓ run complete · duration 15.5s · cost $0.0214"}
-]
+# ── Simple rate limiter (token bucket per IP) ─────────────────────────────
 
-MOCK_HISTORY = [
-    {"id": "run_5b2a", "repo": "vuln-flask-app",          "when": "2 min ago",  "status": "resolved",  "findings": 2, "fixed": 2, "dur": "15.5s", "cost": "$0.021"},
-    {"id": "run_5b29", "repo": "sketchy-microservice",    "when": "14 min ago", "status": "resolved",  "findings": 3, "fixed": 3, "dur": "38.2s", "cost": "$0.061"},
-    {"id": "run_5b28", "repo": "internal/payments-api",   "when": "1 h ago",    "status": "partial",   "findings": 4, "fixed": 2, "dur": "1m 04s","cost": "$0.114"},
-    {"id": "run_5b27", "repo": "internal/billing",        "when": "3 h ago",    "status": "resolved",  "findings": 2, "fixed": 2, "dur": "22.0s", "cost": "$0.039"},
-    {"id": "run_5b26", "repo": "oss/htmx-fork",           "when": "Yesterday",  "status": "clean",     "findings": 0, "fixed": 0, "dur": "7.3s",  "cost": "$0.008"},
-    {"id": "run_5b25", "repo": "internal/risk-engine",    "when": "Yesterday",  "status": "failed",    "findings": 0, "fixed": 0, "dur": "3.2s",  "cost": "$0.003"},
-    {"id": "run_5b24", "repo": "oss/lite-orm",            "when": "2 d ago",    "status": "partial",   "findings": 6, "fixed": 4, "dur": "2m 11s","cost": "$0.231"},
-    {"id": "run_5b23", "repo": "internal/auth-svc",       "when": "2 d ago",    "status": "resolved",  "findings": 1, "fixed": 1, "dur": "14.5s", "cost": "$0.018"},
-    {"id": "run_5b22", "repo": "oss/feedparse",           "when": "3 d ago",    "status": "clean",     "findings": 0, "fixed": 0, "dur": "5.8s",  "cost": "$0.006"},
-]
+_rate: dict[str, tuple[float, int]] = {}  # ip → (window_start, count)
+_RATE_WINDOW = 60.0
+_RATE_LIMIT = int(os.environ.get("JANUS_RATE_LIMIT", "20"))
 
-MOCK_SYSTEM = {
-    "gpu":      {"name": "AMD Instinct MI300X", "util": 67, "mem": "142 / 192 GB", "temp": "62°C"},
-    "endpoint": {"url": "rocm0:8000", "model": "Qwen3.5-9B", "tok_s": 184, "ctx": "24,892 / 262,144"},
-    "budget":   {"spent": 12.84, "total": 100.00},
-}
 
-# ── Endpoints ─────────────────────────────────────────────────────────────
+def _check_rate(ip: str) -> None:
+    now = time.time()
+    start, count = _rate.get(ip, (now, 0))
+    if now - start > _RATE_WINDOW:
+        _rate[ip] = (now, 1)
+        return
+    if count >= _RATE_LIMIT:
+        raise HTTPException(status_code=429, detail="Rate limit exceeded — wait 60 s")
+    _rate[ip] = (start, count + 1)
 
-@app.get("/api/repo")
-def get_repo():
-    return MOCK_REPO
 
-@app.get("/api/filetree")
-def get_filetree():
-    return MOCK_FILETREE
+# ── Request / response schemas ─────────────────────────────────────────────
 
-@app.get("/api/sweep")
-def get_sweep():
-    return MOCK_SWEEP
+class CreateRunRequest(BaseModel):
+    target: str = Field(
+        description="GitHub URL (github.com/owner/repo), local file path, or local directory path"
+    )
+    max_cycles: int = Field(default=3, ge=1, le=10)
+    dry_run: bool = Field(default=False)
+    backup: bool = Field(default=False)
+    concurrency: int = Field(default=3, ge=1, le=16)
+    max_files: int = Field(default=100, ge=1, le=500)
+    enable_semgrep: bool = Field(default=False)
 
-@app.get("/api/findings")
-def get_findings():
-    return MOCK_FINDINGS
+    @field_validator("target")
+    @classmethod
+    def target_not_empty(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("target must not be empty")
+        return v
 
-@app.get("/api/history")
-def get_history():
-    return MOCK_HISTORY
+
+# ── Emit helper shared by background task ────────────────────────────────
+
+def _make_emit(rec: RunRecord, loop: asyncio.AbstractEventLoop):
+    t0 = time.time()
+
+    def emit(event: dict[str, Any]) -> None:
+        event = {
+            "t": round((time.time() - t0) * 1000),  # ms since run start
+            **event,
+        }
+        rec.events.append(event)
+        if rec.queue is not None:
+            loop.call_soon_threadsafe(rec.queue.put_nowait, event)
+
+    return emit
+
+
+def _close_sse(rec: RunRecord, loop: asyncio.AbstractEventLoop) -> None:
+    if rec.queue is not None:
+        loop.call_soon_threadsafe(rec.queue.put_nowait, None)  # sentinel
+
+
+# ── Result → finding extractor ────────────────────────────────────────────
+
+def _extract_findings(
+    events: list[dict],
+    results: list[JanusResult],
+    run_id: str,
+) -> list[dict]:
+    """Build finding records from trace events (which capture every Red verdict).
+
+    Reading from result.last_report would miss findings that were detected and
+    then patched — since the final scan is clean, last_report.is_secure_report()
+    returns True and the original vuln is invisible. The trace stream preserves
+    the FIRST detection per file, which is what we want.
+    """
+    # Map file path → final per-file result (for patched/cycles status)
+    by_file: dict[str, JanusResult] = {}
+    for r in results:
+        if r.target:
+            by_file[r.target] = r
+
+    findings: list[dict] = []
+    seen_files: set[str] = set()  # only emit the first detection per file
+
+    for ev in events:
+        if ev.get("kind") != "finding" or ev.get("agent") != "red":
+            continue
+        fpath = ev.get("file", "")
+        if fpath in seen_files:
+            continue
+        seen_files.add(fpath)
+
+        result = by_file.get(fpath)
+        findings.append({
+            "id": f"{run_id[:8]}-{len(findings):03d}",
+            "run_id": run_id,
+            "file": fpath,
+            "vulnerability_type": ev.get("cwe", "unknown"),
+            "snippet": ev.get("snippet", ""),
+            "payload": ev.get("payload", ""),
+            "patched": bool(result and result.ok and result.patch_cycles > 0),
+            "patch_cycles": result.patch_cycles if result else 0,
+            "static_warnings": result.static_warnings if result else [],
+            "dry_run": result.dry_run if result else False,
+        })
+
+    return findings
+
+
+# ── Background scan task ──────────────────────────────────────────────────
+
+async def _execute_run(rec: RunRecord, body: CreateRunRequest) -> None:
+    loop = asyncio.get_running_loop()
+    emit = _make_emit(rec, loop)
+    store.update(rec.run_id, status="running", started_at=time.time(), queue=rec.queue)
+
+    tmp_dir: Path | None = None
+    scan_root: Path | None = None
+    results: list[JanusResult] = []
+
+    try:
+        target = body.target
+
+        # ── Resolve target ────────────────────────────────────────────────
+        if is_github_url(target):
+            emit({"agent": "system", "line": f"Cloning repository: {target}"})
+            try:
+                tmp_dir = await clone_repo(target, timeout_s=120)
+                scan_root = tmp_dir
+                store.update(rec.run_id, tmp_dir=tmp_dir)
+                emit({"agent": "system", "line": f"Clone complete → {tmp_dir}"})
+            except (GitHubURLError, TimeoutError, RuntimeError) as exc:
+                raise RuntimeError(f"Repository clone failed: {exc}") from exc
+
+        else:
+            p = Path(target).expanduser().resolve()
+            if not p.exists():
+                raise FileNotFoundError(f"Path not found: {target!r}")
+            scan_root = p
+
+        # ── Discover files ────────────────────────────────────────────────
+        if scan_root.is_file():
+            py_files = [scan_root] if scan_root.suffix == ".py" else []
+        else:
+            emit({"agent": "system", "line": f"Discovering Python files in {scan_root.name}…"})
+            py_files = iter_python_files(scan_root, max_files=body.max_files)
+
+        if not py_files:
+            raise ValueError("No Python (.py) files found in the target.")
+
+        emit({"agent": "system", "line": f"Found {len(py_files)} Python file(s) to scan."})
+        store.update(rec.run_id, files_scanned=len(py_files))
+
+        # ── Scan each file ────────────────────────────────────────────────
+        sem = asyncio.Semaphore(body.concurrency)
+        scan_tasks = []
+        for fpath in py_files:
+            scan_tasks.append(_scan_one(rec, fpath, body, emit, loop, sem))
+
+        file_results = await asyncio.gather(*scan_tasks, return_exceptions=True)
+
+        for fr in file_results:
+            if isinstance(fr, Exception):
+                emit({"agent": "system", "line": f"File scan error: {fr}", "kind": "error"})
+            else:
+                results.append(fr)
+
+        # ── Finalize ──────────────────────────────────────────────────────
+        patched_count = sum(1 for r in results if r.ok and r.patch_cycles > 0)
+        total_cycles = sum(r.patch_cycles for r in results)
+        findings = _extract_findings(rec.events, results, rec.run_id)
+
+        summary = {
+            "files_scanned": len(results),
+            "files_patched": patched_count,
+            "findings_count": len(findings),
+            "patch_cycles_total": total_cycles,
+        }
+
+        emit({
+            "agent": "system",
+            "line": (
+                f"✓ Scan complete — {len(findings)} finding(s), "
+                f"{patched_count}/{len(results)} files patched."
+            ),
+            "kind": "ok",
+            "summary": summary,
+        })
+
+        store.update(
+            rec.run_id,
+            status="done",
+            finished_at=time.time(),
+            findings=findings,
+            files_patched=patched_count,
+            patch_cycles_total=total_cycles,
+            result=summary,
+        )
+
+    except Exception as exc:
+        logger.exception("Run %s failed", rec.run_id)
+        err_msg = str(exc)
+        emit({"agent": "system", "line": f"Run failed: {err_msg}", "kind": "error"})
+        store.update(
+            rec.run_id,
+            status="error",
+            finished_at=time.time(),
+            error=err_msg,
+        )
+    finally:
+        _close_sse(rec, loop)
+        if tmp_dir is not None:
+            cleanup_clone(tmp_dir)
+
+
+async def _scan_one(
+    rec: RunRecord,
+    fpath: Path,
+    body: CreateRunRequest,
+    emit,
+    loop: asyncio.AbstractEventLoop,
+    sem: asyncio.Semaphore,
+) -> JanusResult:
+    async with sem:
+        rel = fpath.name
+        emit({"agent": "system", "line": f"→ Scanning {rel}"})
+
+        def per_file_trace(event: dict) -> None:
+            event["file"] = str(fpath)
+            emit(event)
+
+        result = await loop.run_in_executor(
+            None,
+            lambda: run_janus_on_file(
+                fpath,
+                max_patch_cycles=body.max_cycles,
+                dry_run=body.dry_run,
+                backup_before_write=body.backup,
+                enable_semgrep=body.enable_semgrep,
+                trace_fn=per_file_trace,
+            ),
+        )
+
+        status = "patched" if (result.ok and result.patch_cycles > 0) else "clean" if result.ok else "failed"
+        emit({"agent": "system", "line": f"  {rel}: {status} (cycles={result.patch_cycles})"})
+        return result
+
+
+# ── API endpoints ─────────────────────────────────────────────────────────
+
+@app.post("/api/runs", status_code=202)
+async def create_run(
+    body: CreateRunRequest,
+    request: Request,
+    background_tasks: BackgroundTasks,
+) -> dict:
+    _check_rate(request.client.host if request.client else "unknown")
+
+    rec = store.create(
+        target=body.target,
+        mode="repo" if is_github_url(body.target) else "dir",
+    )
+    rec.queue = asyncio.Queue()
+
+    background_tasks.add_task(_execute_run, rec, body)
+
+    return {
+        "run_id": rec.run_id,
+        "status": rec.status,
+        "target": rec.target,
+    }
+
+
+@app.get("/api/runs")
+async def list_runs(limit: int = 50) -> list[dict]:
+    return [r.to_dict() for r in store.list_recent(min(limit, 200))]
+
+
+@app.get("/api/runs/{run_id}")
+async def get_run(run_id: str) -> dict:
+    rec = store.get(run_id)
+    if rec is None:
+        raise HTTPException(status_code=404, detail=f"Run {run_id!r} not found")
+    d = rec.to_dict()
+    d["result"] = rec.result
+    d["error"] = rec.error
+    return d
+
+
+@app.get("/api/runs/{run_id}/findings")
+async def get_findings(run_id: str) -> list[dict]:
+    rec = store.get(run_id)
+    if rec is None:
+        raise HTTPException(status_code=404, detail=f"Run {run_id!r} not found")
+    return rec.findings
+
+
+@app.delete("/api/runs/{run_id}", status_code=204)
+async def delete_run(run_id: str) -> None:
+    rec = store.get(run_id)
+    if rec is None:
+        raise HTTPException(status_code=404, detail=f"Run {run_id!r} not found")
+    store.update(run_id, status="cancelled")
+    if rec.tmp_dir:
+        cleanup_clone(rec.tmp_dir)
+
+
+@app.get("/api/runs/{run_id}/events")
+async def stream_events(run_id: str, request: Request) -> StreamingResponse:
+    rec = store.get(run_id)
+    if rec is None:
+        raise HTTPException(status_code=404, detail=f"Run {run_id!r} not found")
+
+    async def generator():
+        # Replay history so late-connecting clients see full trace
+        for event in list(rec.events):
+            yield f"data: {json.dumps(event)}\n\n"
+
+        # Stream live events if run is still active
+        if rec.status in ("queued", "running") and rec.queue is not None:
+            while True:
+                if await request.is_disconnected():
+                    break
+                try:
+                    event = await asyncio.wait_for(rec.queue.get(), timeout=25.0)
+                except asyncio.TimeoutError:
+                    yield ": keepalive\n\n"
+                    continue
+                if event is None:  # sentinel: run finished
+                    break
+                yield f"data: {json.dumps(event)}\n\n"
+
+        yield "data: {\"agent\":\"system\",\"line\":\"stream closed\",\"kind\":\"eof\"}\n\n"
+
+    return StreamingResponse(
+        generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
+
+
+@app.get("/api/health")
+async def health() -> dict:
+    providers = check_provider_health()
+    any_ok = any(p["ok"] for p in providers)
+    return {
+        "status": "ok" if any_ok else "degraded",
+        "providers": providers,
+        "active_runs": sum(1 for r in store.list_recent(200) if r.status == "running"),
+    }
+
 
 @app.get("/api/system")
-def get_system():
-    return MOCK_SYSTEM
+async def system_status() -> dict:
+    cfg = load_llm_config()
+    return {
+        "gpu": {
+            "name": os.environ.get("JANUS_GPU_NAME", "AMD Instinct MI300X"),
+            "count": int(os.environ.get("JANUS_GPU_COUNT", "1")),
+            "vram_gb": int(os.environ.get("JANUS_GPU_VRAM_GB", "192")),
+            "util": None,
+            "mem": os.environ.get("JANUS_GPU_MEM", "N/A"),
+            "temp": None,
+            "vcpu": int(os.environ.get("JANUS_VCPU", "20")),
+            "ram_gb": int(os.environ.get("JANUS_RAM_GB", "240")),
+        },
+        "endpoint": {
+            "url": cfg.base_url,
+            "model": cfg.model,
+            "provider": cfg.provider_name,
+        },
+        "budget": {
+            "spent": float(os.environ.get("JANUS_BUDGET_SPENT", "0")),
+            "total": float(os.environ.get("JANUS_BUDGET_TOTAL", "100")),
+        },
+    }
+
+
+# ── Legacy GET endpoints (kept for frontend compatibility) ────────────────
+
+@app.get("/api/repo")
+async def get_repo() -> dict:
+    runs = store.list_recent(1)
+    if runs and runs[0].target:
+        return {
+            "url": runs[0].target.replace("https://", "").replace("http://", ""),
+            "name": Path(runs[0].target).name,
+            "owner": "",
+            "branch": "main",
+            "commit": "–",
+            "language": "Python",
+            "files": runs[0].files_scanned,
+            "loc": 0,
+            "size": "–",
+        }
+    return {
+        "url": "github.com/openwing-labs/vuln-flask-app",
+        "name": "vuln-flask-app",
+        "owner": "openwing-labs",
+        "branch": "main",
+        "commit": "–",
+        "language": "Python",
+        "files": 0,
+        "loc": 0,
+        "size": "–",
+    }
+
+
+@app.get("/api/filetree")
+async def get_filetree() -> list:
+    runs = store.list_recent(1)
+    if not runs:
+        return []
+    rec = runs[0]
+    return [
+        {
+            "path": f["file"],
+            "loc": 0,
+            "status": "critical" if not f["patched"] else "clean",
+            "vulnerability_type": f["vulnerability_type"],
+        }
+        for f in rec.findings
+    ]
+
+
+@app.get("/api/sweep")
+async def get_sweep() -> list:
+    runs = store.list_recent(1)
+    if not runs:
+        return []
+    return [r.to_dict() for r in store.list_recent(20)]
+
+
+@app.get("/api/history")
+async def get_history() -> list:
+    return [r.to_dict() for r in store.list_recent(50)]
+
 
 @app.get("/api/trace")
-def get_trace():
-    return MOCK_TRACE
+async def get_trace(run_id: str | None = None) -> list:
+    if run_id:
+        rec = store.get(run_id)
+        return rec.events if rec else []
+    runs = store.list_recent(1)
+    return runs[0].events if runs else []
 
-# Note: Streaming endpoint for SSE could be implemented like this:
-# @app.get("/api/runs/{run_id}/events")
-# async def stream_events(run_id: str):
-#     async def event_generator():
-#         for entry in MOCK_TRACE:
-#             yield f"data: {json.dumps(entry)}\n\n"
-#             await asyncio.sleep(0.1) # Simulate delay
-#     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
-# Mount frontend directory for static serving
-# Ensure the 'frontend' directory exists relative to where you run uvicorn
-app.mount("/", StaticFiles(directory="frontend", html=True), name="frontend")
+# ── Static frontend ───────────────────────────────────────────────────────
+
+_frontend_dir = Path(__file__).resolve().parent.parent.parent / "frontend"
+if _frontend_dir.exists():
+    app.mount("/", StaticFiles(directory=str(_frontend_dir), html=True), name="frontend")

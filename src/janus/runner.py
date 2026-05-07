@@ -46,6 +46,7 @@ async def _run_one(
     backup_before_write: bool,
     syntax_attempt_budget: int,
     progress_path: Path | None,
+    trace_fn=None,
 ) -> JanusResult:
     """Run Janus on a single file, guarded by semaphore."""
 
@@ -60,6 +61,7 @@ async def _run_one(
                 dry_run=dry_run,
                 backup_before_write=backup_before_write,
                 max_syntax_attempts_per_patch=syntax_attempt_budget,
+                trace_fn=trace_fn,
             ),
         )
 

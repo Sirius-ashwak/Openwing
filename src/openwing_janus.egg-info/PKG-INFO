@@ -4,22 +4,26 @@ Version: 0.1.0
 Summary: Openwing Janus: Red/Blue multi-agent MVP for Flask SQLi remediation
 Requires-Python: >=3.10
 Description-Content-Type: text/markdown
+License-File: LICENSE
 Requires-Dist: httpx>=0.27.0
 Requires-Dist: pydantic>=2.7.0
 Requires-Dist: typer>=0.12.0
 Requires-Dist: rich>=13.7.0
 Requires-Dist: langgraph>=0.2.0
 Requires-Dist: langchain-core>=0.3.0
+Requires-Dist: fastapi>=0.100.0
+Requires-Dist: uvicorn>=0.23.0
 Provides-Extra: examples
 Requires-Dist: flask>=3.0.0; extra == "examples"
 Provides-Extra: dev
 Requires-Dist: pytest>=8.0.0; extra == "dev"
 Provides-Extra: semgrep
 Requires-Dist: semgrep>=1.50.0; extra == "semgrep"
+Dynamic: license-file
 
 # Openwing: Janus (hackathon MVP)
 
-Local **Red Team / Blue Team** loop: an LLM scans aggressively for OWASP-aligned issues (**SQL injection** first, plus SSRF / command primitive / heuristic catches), proposes a **full-file patch**, runs an **inline Python compile gate** with adaptive Blue retries, then re-scans. LangGraph **`StateGraph`** wires the cyclic graph with a configurable patch budget (default **3** cycles). Payloads remain **informational strings**—nothing is executed remotely.
+Local **Red Team / Blue Team** loop: an LLM scans aggressively for OWASP-aligned issues (**SQL injection** first, plus SSRF / command primitive / heuristic catches), proposes a **full-file patch**, runs an **inline Python compile gate** with adaptive Blue retries, then re-scans. LangGraph `**StateGraph`** wires the cyclic graph with a configurable patch budget (default **3** cycles). Payloads remain **informational strings**—nothing is executed remotely.
 
 ## Requirements
 
