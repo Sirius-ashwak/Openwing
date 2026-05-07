@@ -26,7 +26,7 @@ pip install -r examples/vulnerable_app/requirements.txt
 | ----------------- | ----------------------------------------------- | ---------------------------------------- |
 | `OPENAI_API_KEY`  | Bearer token if your server requires it         | `EMPTY` (many local servers ignore this) |
 | `OPENAI_BASE_URL` | OpenAI-compatible API root (must include `/v1`) | `http://localhost:8000/v1`               |
-| `LLM_MODEL`       | Model id (alias: `OPENAI_MODEL`, `JANUS_MODEL`) | `Qwen/Qwen2.5-7B-Instruct`               |
+| `LLM_MODEL`       | Model id (alias: `OPENAI_MODEL`, `JANUS_MODEL`) | `Qwen/Qwen2.5-72B-Instruct`              |
 | `OPENAI_TIMEOUT`  | HTTP timeout seconds                            | `120`                                    |
 
 
@@ -37,7 +37,7 @@ If `OPENAI_BASE_URL` is set without a trailing `/v1`, Janus appends `/v1` when n
 Serve a model on port 8000, then:
 
 ```bash
-set LLM_MODEL=Qwen/Qwen2.5-7B-Instruct
+set LLM_MODEL=Qwen/Qwen2.5-72B-Instruct
 set OPENAI_BASE_URL=http://localhost:8000/v1
 python -m janus run --path examples/vulnerable_app/app.py
 ```

@@ -28,7 +28,7 @@ Go to **Settings → Secrets and variables → Actions → Variables**:
 | Variable | Value | Purpose |
 |----------|-------|---------|
 | `JANUS_LIVE_SCAN` | `true` | Enables the live scan job |
-| `LLM_MODEL` | `Qwen/Qwen2.5-7B-Instruct` | Model identifier (optional) |
+| `LLM_MODEL` | `Qwen/Qwen2.5-72B-Instruct` | Model identifier (optional) |
 
 ### 2. Set Repository Secrets
 
@@ -44,13 +44,19 @@ Go to **Settings → Secrets and variables → Actions → Secrets**:
 If running vLLM on your own infrastructure:
 
 ```bash
-# Start vLLM (AMD ROCm) with the massive 72B model!
+# AMD MI300X — 192 GB VRAM, single GPU, fits Qwen2.5-72B in fp16 (~144 GB) with ~48 GB spare
 docker run --device /dev/kfd --device /dev/dri \
+  --group-add video \
   -p 8000:8000 \
+  -v /scratch:/scratch \
   rocm/vllm:latest \
-  --model Qwen/Qwen2.5-72B-Instruct --tensor-parallel-size 1
+  --model Qwen/Qwen2.5-72B-Instruct \
+  --tensor-parallel-size 1 \
+  --max-model-len 32768 \
+  --gpu-memory-utilization 0.90 \
+  --dtype float16
 
-# Set OPENAI_BASE_URL in GitHub secrets to your server's URL
+# Set OPENAI_BASE_URL in GitHub secrets to your server's public IP:8000/v1
 ```
 
 ## SARIF Upload Permissions

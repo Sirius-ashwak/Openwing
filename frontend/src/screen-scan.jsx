@@ -218,7 +218,8 @@ function ScreenScan({ runState, onStart, scenario, setScenario }) {
 
         <Section label="Cluster">
           <KV k="Provider" v={<span className="mono" style={{ fontSize: 11 }}>AMD Developer Cloud</span>} />
-          <KV k="Instance" v={<span className="mono" style={{ fontSize: 11 }}>1× Instinct MI300X · 192 GB</span>} />
+          <KV k="Instance" v={<span className="mono" style={{ fontSize: 11 }}>1× MI300X · 192 GB VRAM · 20 vCPU · 240 GB RAM</span>} />
+          <KV k="Storage" v={<span className="mono" style={{ fontSize: 11 }}>720 GB boot · 5 TB scratch NVMe</span>} />
           <KV k="Runtime" v={<span className="mono" style={{ fontSize: 11 }}>ROCm 6.2 · vLLM 0.6.3</span>} />
           <KV k="Endpoint" v={<span className="mono" style={{ fontSize: 11, color: 'var(--ok)' }}>● online</span>} />
           <div style={{ marginTop: 10 }}>
