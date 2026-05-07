@@ -1,0 +1,161 @@
+/* ── Openwing Design System ─────────────────────────────────────────────── */
+
+:root{
+  /* Surface */
+  --bg:        #0c0d0f;
+  --bg-1:      #111315;
+  --bg-2:      #16181b;
+  --bg-3:      #1c1f23;
+  --bg-soft:   #1f2227;
+  --line:      #23272d;
+  --line-soft: #1a1d21;
+
+  /* Text */
+  --fg:        #e6e7ea;
+  --fg-mid:    #9ba0a8;
+  --fg-dim:    #6a7079;
+  --fg-faint:  #4a4f57;
+
+  /* Agent palette — picked to read as adversaries without being literal red/blue */
+  --red:       #ff5b5b;     /* Janus Red — offensive */
+  --red-soft:  #ff8b6b;
+  --red-bg:    rgba(255,91,91,.08);
+  --red-line:  rgba(255,91,91,.22);
+
+  --blue:      #66d4ff;     /* Janus Blue — defensive */
+  --blue-soft: #92e6ff;
+  --blue-bg:   rgba(102,212,255,.08);
+  --blue-line: rgba(102,212,255,.24);
+
+  --ok:        #7ee787;
+  --ok-bg:     rgba(126,231,135,.08);
+  --warn:      #f1c453;
+  --crit:      #ff5b5b;
+
+  --accent:    #c5ff4a;     /* Openwing accent — toxic green for system/orchestrator */
+  --accent-bg: rgba(197,255,74,.1);
+  --accent-line: rgba(197,255,74,.3);
+
+  /* Type */
+  --mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+  --sans: 'Inter', ui-sans-serif, system-ui, -apple-system, sans-serif;
+
+  /* Density (rewritten by Tweaks) */
+  --row-h: 28px;
+  --pad: 12px;
+}
+
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);font-family:var(--sans);
+  font-size:13px;line-height:1.4;-webkit-font-smoothing:antialiased;
+  text-rendering:optimizeLegibility}
+body{overflow:hidden}
+button{font:inherit;color:inherit}
+::selection{background:var(--accent);color:#0a0a0a}
+
+/* Custom scrollbars throughout */
+*::-webkit-scrollbar{width:10px;height:10px}
+*::-webkit-scrollbar-track{background:transparent}
+*::-webkit-scrollbar-thumb{background:#2a2e34;border-radius:10px;border:2px solid var(--bg);background-clip:content-box}
+*::-webkit-scrollbar-thumb:hover{background:#373c44;background-clip:content-box;border:2px solid var(--bg)}
+
+/* ── Utility ───────────────────────────────────────────────────────────── */
+.mono{font-family:var(--mono);font-feature-settings:"calt" 0,"liga" 0,"ss01" 1}
+.uppercase{text-transform:uppercase;letter-spacing:.08em}
+.hidden{display:none !important}
+
+/* Hairline texture for empty cards */
+.hatch{background-image:
+  repeating-linear-gradient(135deg, transparent 0 7px, rgba(255,255,255,.025) 7px 8px)}
+
+/* ── Animations ────────────────────────────────────────────────────────── */
+@keyframes pulse-red {0%{box-shadow:0 0 0 0 rgba(255,91,91,.55)}100%{box-shadow:0 0 0 8px rgba(255,91,91,0)}}
+@keyframes pulse-blue {0%{box-shadow:0 0 0 0 rgba(102,212,255,.55)}100%{box-shadow:0 0 0 8px rgba(102,212,255,0)}}
+@keyframes pulse-acc  {0%{box-shadow:0 0 0 0 rgba(197,255,74,.55)}100%{box-shadow:0 0 0 8px rgba(197,255,74,0)}}
+@keyframes caret-blink{0%,49%{opacity:1}50%,100%{opacity:0}}
+@keyframes shimmer{0%{background-position:-400px 0}100%{background-position:400px 0}}
+
+/* ── Status dots ───────────────────────────────────────────────────────── */
+.dot{display:inline-block;width:6px;height:6px;border-radius:999px}
+.dot.red{background:var(--red);animation:pulse-red 1.4s infinite}
+.dot.blue{background:var(--blue);animation:pulse-blue 1.4s infinite}
+.dot.acc{background:var(--accent);animation:pulse-acc 1.4s infinite}
+.dot.ok{background:var(--ok)}
+.dot.idle{background:var(--fg-dim)}
+
+/* Caret blink for streaming output */
+.caret{display:inline-block;width:7px;height:13px;background:currentColor;
+  margin-left:2px;vertical-align:-2px;animation:caret-blink 1s steps(1) infinite}
+
+/* ── Code blocks ───────────────────────────────────────────────────────── */
+.code{font-family:var(--mono);font-size:12px;line-height:1.55;
+  background:var(--bg-1);border:1px solid var(--line);border-radius:6px;
+  padding:12px 14px;overflow:auto;tab-size:2;white-space:pre}
+.code .ln{color:var(--fg-faint);user-select:none;display:inline-block;width:28px;text-align:right;padding-right:12px}
+.tk-kw{color:#c792ea}
+.tk-str{color:#c3e88d}
+.tk-num{color:#f78c6c}
+.tk-fn{color:#82aaff}
+.tk-com{color:#5c6370;font-style:italic}
+.tk-op{color:#89ddff}
+.tk-tag{color:#ffcb6b}
+
+/* ── Diff colors ───────────────────────────────────────────────────────── */
+.diff-add{background:rgba(126,231,135,.07)}
+.diff-add::before{content:'+ ';color:var(--ok);position:absolute;left:8px}
+.diff-rem{background:rgba(255,91,91,.07)}
+.diff-rem::before{content:'− ';color:var(--red);position:absolute;left:8px}
+.diff-line{display:block;position:relative;padding:0 12px 0 32px}
+.diff-line.diff-ctx{padding-left:32px}
+.diff-line.diff-ctx::before{content:'  ';position:absolute;left:8px;color:var(--fg-faint)}
+
+/* ── Buttons ───────────────────────────────────────────────────────────── */
+.btn{display:inline-flex;align-items:center;gap:8px;height:30px;padding:0 12px;
+  background:var(--bg-3);border:1px solid var(--line);border-radius:6px;
+  color:var(--fg);font-size:12px;font-weight:500;cursor:pointer;
+  transition:background .12s,border-color .12s}
+.btn:hover{background:var(--bg-soft);border-color:#2d3239}
+.btn.primary{background:var(--accent);color:#0a0a0a;border-color:var(--accent)}
+.btn.primary:hover{background:#d3ff5e;border-color:#d3ff5e}
+.btn.danger{background:transparent;color:var(--red);border-color:var(--red-line)}
+.btn.danger:hover{background:var(--red-bg)}
+.btn.ghost{background:transparent;border-color:transparent}
+.btn.ghost:hover{background:var(--bg-3)}
+.btn.sm{height:24px;padding:0 8px;font-size:11px}
+.btn[disabled]{opacity:.45;cursor:not-allowed}
+.kbd{font-family:var(--mono);font-size:10.5px;color:var(--fg-dim);
+  border:1px solid var(--line);border-bottom-width:2px;border-radius:4px;padding:1px 5px;
+  background:var(--bg-2)}
+
+/* ── Pills ─────────────────────────────────────────────────────────────── */
+.pill{display:inline-flex;align-items:center;gap:6px;height:20px;padding:0 8px;
+  border-radius:999px;font-size:10.5px;font-weight:500;
+  font-family:var(--mono);text-transform:uppercase;letter-spacing:.06em;
+  border:1px solid var(--line);background:var(--bg-2);color:var(--fg-mid)}
+.pill.red{background:var(--red-bg);border-color:var(--red-line);color:var(--red)}
+.pill.blue{background:var(--blue-bg);border-color:var(--blue-line);color:var(--blue)}
+.pill.acc{background:var(--accent-bg);border-color:var(--accent-line);color:var(--accent)}
+.pill.ok{background:var(--ok-bg);border-color:rgba(126,231,135,.25);color:var(--ok)}
+.pill.warn{background:rgba(241,196,83,.08);border-color:rgba(241,196,83,.25);color:var(--warn)}
+
+/* ── Panels ────────────────────────────────────────────────────────────── */
+.panel{background:var(--bg-1);border:1px solid var(--line);border-radius:8px;overflow:hidden}
+.panel-hd{display:flex;align-items:center;justify-content:space-between;
+  padding:10px 14px;border-bottom:1px solid var(--line);background:var(--bg-2)}
+.panel-hd h3{margin:0;font-size:11px;font-weight:600;letter-spacing:.08em;
+  text-transform:uppercase;color:var(--fg-mid)}
+.panel-bd{padding:14px}
+
+/* ── Toolbar dividers ──────────────────────────────────────────────────── */
+.vdiv{width:1px;height:18px;background:var(--line);margin:0 4px}
+
+/* ── App shell grid ────────────────────────────────────────────────────── */
+.app{
+  display:grid;
+  grid-template-columns: 240px 1fr;
+  grid-template-rows: 44px 1fr;
+  height:100vh;width:100vw;
+}
+.app > .topbar{grid-column: 1 / -1}
+.app > .sidebar{grid-row: 2 / 3}
+.app > .main{grid-row: 2 / 3; min-width:0; overflow:hidden}
