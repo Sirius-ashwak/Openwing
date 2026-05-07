@@ -1,52 +1,58 @@
 """Red / Blue LLM agents (static analysis and patching only — no exploit execution)."""
-
 from __future__ import annotations
 
 from janus import llm as _llm
 from janus.schemas import RedTeamReport, coerce_patched_code, parse_red_team_json
+from janus.vuln_kb import build_kb_section
 
-RED_SYSTEM_PROMPT = """You are a senior adversarial reviewer (Red Team) doing **static analysis only**.
-Hunt ruthlessly—but honestly—for **critical** flaws in Flask / Python web handlers.
+_KB_SECTION = build_kb_section(max_priority=2)
 
-PRIMARY FOCUS:
-- CWE-89 SQL injection: string concat / f-strings / %-format inside sqlite3/mysql/psycopg ``execute()``,
-  OR dynamic SQL blobs passed to ``execute()`` from concatenated inputs (including indirectly via vars).
-  Call out ``request.args`` / ``request.form`` / ``request.json`` flowing into queries.
+RED_SYSTEM_PROMPT = f"""You are a senior adversarial reviewer (Red Team) doing **static analysis only**.
+Hunt ruthlessly — but honestly — for **critical and high** security flaws in Python web handlers.
 
-HIGH-VALUE SECONDARIES (still report if confidently present—do not hallucinate thin air):
-- SSRF tendencies: outbound HTTP libs (requests/httpx/aiohttp/urllib) where URL/host comes from clients.
-- OS command injection: ``subprocess`` with ``shell=True`` or string shells built from user input.
-- Path traversal primitives: unchecked ``open()`` / uploads using user-derived paths without normalization.
+{_KB_SECTION}
 
 OUTPUT FORMAT:
-Return ONLY ONE JSON object (no prose, no fences) EXACTLY with keys:
-  "file_path", "vulnerability_type", "vulnerable_code_snippet", "exploit_payload"
+Return ONLY ONE JSON object (no prose, no markdown fences) EXACTLY with these keys:
+  "file_path"               — path of the analyzed file
+  "vulnerability_type"      — CWE id + short name, or "none" if nothing found
+  "vulnerable_code_snippet" — the EXACT offending lines copied from SOURCE (empty if none)
+  "exploit_payload"         — illustrative text payload ONLY (never shell commands); empty if none
 
 Rules:
-- If nothing substantive is found → ``vulnerability_type`` = ``"none"`` and empty snippets/payload strings.
-- ``vulnerable_code_snippet`` must quote the **actual offending lines/expressions** copied from SOURCE.
-- ``exploit_payload`` is illustrative text ONLY (never shell commands or instructions)—e.g., ``admin' OR '1'='1 --``
-  OR ``http://169.254.169.254/`` for SSRF—not executed by us.
+- If nothing substantive is found → vulnerability_type = "none", empty snippet and payload.
+- Report the SINGLE highest-confidence, highest-severity finding.
+- Do NOT hallucinate vulnerabilities that are not clearly present in the source.
+- exploit_payload is for demonstration only; it is never executed.
 """
 
 BLUE_SYSTEM_PROMPT = """You are a hardened production Python/DevSec engineer (Blue Team).
 
 You receive:
-1) REPORT — Red Team structured JSON describing the strongest confirmed issue(s) to fix first.
-2) ORIGINAL_SOURCE — the full-file Python snapshot.
+  REPORT           — Red Team structured JSON describing the confirmed issue to fix.
+  ORIGINAL_SOURCE  — the full-file Python source snapshot.
 
 RULES:
-- Return ONLY runnable Python—the complete file—no Markdown, prose, headings, nor code fences.
-- Fix the REPORTED issue minimally but correctly; keep routes, semantics, formatting style similar.
-- **SQL injection** → parameterized queries ONLY (positional ``?``, ``%(name)s`` style bindings, tuple args).
-  Remove dynamic SQL concatenation from user-derived text.
-- **SSRF / open URLs** → block private/link-local ranges, enforce allow-lists/schemes/host checks, forbid redirects,
-  timeouts, NEVER pass raw ``request.args`` strings into outbound clients without parsing/validation stubs.
-- **Command injection / shell=True** → replace with argv lists, ban ``shell=True`` when influenced by callers.
-- **Path/open issues** → use `` pathlib.Path``, verify roots, reject traversal components.
-- Maintain imports + app factory patterns; preserve public route paths & HTTP verbs.
+- Return ONLY runnable Python — the complete file — no Markdown, prose, or code fences.
+- Fix the REPORTED issue minimally but correctly; preserve routes, semantics, imports, style.
 
-If REPORT.vulnerability_type is ``none`` accidentally but CORRECTION_REQUIRED text is supplied, prioritize that."""
+Remediation rules by vulnerability type:
+  SQL injection       → parameterized queries ONLY (positional ? or %(name)s bindings).
+                        Remove ALL dynamic SQL concatenation of user-derived text.
+  SSRF                → validate scheme (http/https only), resolve hostname, block RFC1918/
+                        loopback/link-local ranges, disable redirect-following, set timeout.
+  Command injection   → replace shell=True + string concat with argv list form; never pass
+                        user input through a shell.
+  Path traversal      → use pathlib.Path, resolve() + verify the result starts with the
+                        allowed root; reject any component containing '..'.
+  XSS                 → use Jinja2 autoescaping; never use render_template_string with
+                        user data; never wrap user strings in Markup().
+  Deserialization     → replace pickle/marshal with JSON; use yaml.safe_load not yaml.load.
+  Open redirect       → validate redirect target against an explicit allowlist of domains.
+  File upload         → enforce extension whitelist, MIME check, size limit, secure_filename().
+
+Maintain all public route paths, HTTP verbs, and Flask app factory patterns.
+If REPORT.vulnerability_type is "none" but CORRECTION_REQUIRED text is supplied, apply that."""
 
 
 def red_team_scan(source: str, file_path: str) -> RedTeamReport:
@@ -55,7 +61,7 @@ def red_team_scan(source: str, file_path: str) -> RedTeamReport:
     raw = _llm.sync_chat(system=RED_SYSTEM_PROMPT, user=user)
     try:
         return parse_red_team_json(raw, file_path)
-    except Exception as first:  # noqa: BLE001 — aggregate parse failures
+    except Exception as first:
         repair_user = (
             "Your previous answer was not valid JSON for the schema. "
             "Respond with ONLY one JSON object with keys: "
@@ -65,8 +71,10 @@ def red_team_scan(source: str, file_path: str) -> RedTeamReport:
         raw2 = _llm.sync_chat(system=RED_SYSTEM_PROMPT, user=repair_user)
         try:
             return parse_red_team_json(raw2, file_path)
-        except Exception as second:  # noqa: BLE001
-            raise ValueError(f"Red Team JSON failed after repair: {first} / {second}") from second
+        except Exception as second:
+            raise ValueError(
+                f"Red Team JSON failed after repair: {first} / {second}"
+            ) from second
 
 
 def blue_team_patch(
