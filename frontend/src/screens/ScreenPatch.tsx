@@ -1,0 +1,247 @@
+import { useState } from 'react';
+import { DiffBlock, Section } from '../components/atoms';
+import { useFindings } from '../store';
+import type { RunState, Scenario } from '../types';
+
+interface Props {
+  runState: RunState;
+  scenario: Scenario;
+}
+
+export function ScreenPatch({ runState }: Props) {
+  const findings = useFindings();
+  const patchableFindings = findings.filter(
+    (f) => f.patchedAt != null && runState.t > f.patchedAt,
+  );
+  const [activeId, setActiveId] = useState<string>(patchableFindings[0]?.id ?? 'JNS-001');
+  const f = patchableFindings.find((x) => x.id === activeId) ?? patchableFindings[0];
+
+  if (!f) {
+    return (
+      <div
+        style={{
+          display: 'flex',
+          flexDirection: 'column',
+          alignItems: 'center',
+          justifyContent: 'center',
+          height: '100%',
+          gap: 16,
+        }}
+      >
+        <span style={{ color: 'var(--fg-faint)', fontSize: 48 }}>🛡</span>
+        <div className="mono" style={{ color: 'var(--fg-dim)', fontSize: 13 }}>
+          Blue Team has not submitted a patch yet …
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <span className={`dot ${runState.t > 8400 ? 'blue' : 'idle'}`} />
+          <span className="mono" style={{ fontSize: 11, color: 'var(--fg-faint)' }}>
+            {runState.t > 8400 ? 'Janus_Blue working …' : 'awaiting Red Team findings'}
+          </span>
+        </div>
+      </div>
+    );
+  }
+
+  const verified = f.verifiedAt != null && runState.t > f.verifiedAt;
+
+  type RatRow = readonly [string, string];
+  const ratJns001: ReadonlyArray<RatRow> = [
+    [
+      'Root cause',
+      'User-controlled `q` interpolated directly into SQL f-string with no escaping or parameterization.',
+    ],
+    [
+      'Fix strategy',
+      'Replace f-string interpolation with a parameterized query. The DB driver handles escaping internally. Build the LIKE wildcard in Python before binding, not in SQL.',
+    ],
+    ['Regression guard', 'Added a 64-character length cap on `q` to limit pathological input.'],
+    ['Test coverage', 'Existing test_users.py ×8 pass. No API contract broken.'],
+  ];
+  const ratJns002: ReadonlyArray<RatRow> = [
+    ['Root cause', 'User URL fed directly to requests.get() with no validation of scheme or destination host.'],
+    [
+      'Fix strategy',
+      'Allow-list http/https schemes only. Resolve the hostname and reject any private/loopback/link-local IP. Block known cloud-metadata hostnames explicitly.',
+    ],
+    [
+      'Regression guard',
+      'Disabled `allow_redirects` to prevent redirect-based bypass to the same private ranges.',
+    ],
+    ['Test coverage', 'Existing test_proxy.py ×6 pass. Added 3 new negative-path cases for blocked URLs.'],
+  ];
+  const rationale = f.id === 'JNS-001' ? ratJns001 : ratJns002;
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', height: '100%', overflow: 'hidden' }}>
+      <div
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          gap: 0,
+          borderBottom: '1px solid var(--line)',
+          background: 'var(--bg-1)',
+          flexShrink: 0,
+          padding: '0 16px',
+        }}
+      >
+        {patchableFindings.map((p) => (
+          <button
+            key={p.id}
+            onClick={() => setActiveId(p.id)}
+            style={{
+              height: 38,
+              padding: '0 16px',
+              background: 'transparent',
+              border: 0,
+              borderBottom: `2px solid ${activeId === p.id ? 'var(--blue)' : 'transparent'}`,
+              color: activeId === p.id ? 'var(--fg)' : 'var(--fg-dim)',
+              fontWeight: activeId === p.id ? 500 : 400,
+              fontSize: 12.5,
+              cursor: 'pointer',
+              display: 'flex',
+              alignItems: 'center',
+              gap: 8,
+            }}
+          >
+            <span
+              className="mono"
+              style={{ fontSize: 11, color: activeId === p.id ? 'var(--blue)' : 'var(--fg-dim)' }}
+            >
+              {p.id}
+            </span>
+            <span>{p.file.split('/').pop()}</span>
+          </button>
+        ))}
+        <div style={{ flex: 1 }} />
+        <span className="mono" style={{ fontSize: 11, color: 'var(--fg-dim)', marginRight: 12 }}>
+          {patchableFindings.length} patch{patchableFindings.length !== 1 ? 'es' : ''} applied
+        </span>
+        <button className="btn sm" disabled title="Coming soon — needs GitHub OAuth scope">
+          <svg width="11" height="11" viewBox="0 0 16 16" fill="none">
+            <path
+              d="M5 3v10M5 3a2 2 0 1 0 0 4 2 2 0 0 0 0-4ZM5 13a2 2 0 1 0 0-4 2 2 0 0 0 0 4ZM11 13a2 2 0 1 0 0-4 2 2 0 0 0 0 4Zm0-4V6a2 2 0 0 0-2-2H7"
+              stroke="currentColor"
+              strokeWidth="1.4"
+            />
+          </svg>
+          <span>Open PR</span>
+        </button>
+      </div>
+
+      <div
+        style={{
+          padding: '10px 16px',
+          borderBottom: '1px solid var(--line)',
+          background: 'var(--bg)',
+          display: 'flex',
+          alignItems: 'center',
+          gap: 12,
+          flexShrink: 0,
+        }}
+      >
+        <span className="pill blue">PATCH for {f.id}</span>
+        <span className="mono" style={{ fontSize: 12, color: 'var(--fg-mid)' }}>
+          {f.file}
+        </span>
+        <span style={{ flex: 1 }} />
+        <span className="pill ok">tests passing</span>
+        {verified && <span className="pill ok">verification passed</span>}
+        <span className="pill blue">generated by Janus_Blue</span>
+      </div>
+
+      <div
+        style={{
+          flex: 1,
+          display: 'grid',
+          gridTemplateColumns: '1fr 1fr',
+          overflow: 'hidden',
+          minHeight: 0,
+        }}
+      >
+        <div
+          style={{
+            borderRight: '1px solid var(--line)',
+            overflow: 'auto',
+            padding: 16,
+            display: 'flex',
+            flexDirection: 'column',
+            gap: 16,
+          }}
+        >
+          <Section label="Patch rationale">
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+              {rationale.map(([k, v]) => (
+                <div key={k}>
+                  <div
+                    style={{
+                      fontSize: 11,
+                      fontWeight: 600,
+                      color: 'var(--blue)',
+                      letterSpacing: '.04em',
+                      marginBottom: 3,
+                    }}
+                  >
+                    {k}
+                  </div>
+                  <div style={{ fontSize: 13, color: 'var(--fg-mid)', lineHeight: 1.6 }}>{v}</div>
+                </div>
+              ))}
+            </div>
+          </Section>
+
+          <Section label="Changed files">
+            <div style={{ fontFamily: 'var(--mono)', fontSize: 12 }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '6px 0' }}>
+                <span style={{ color: 'var(--fg-mid)', flex: 1 }}>{f.file}</span>
+                <span style={{ color: 'var(--ok)' }}>+{f.id === 'JNS-002' ? 22 : 4}</span>
+                <span style={{ color: 'var(--red)' }}>−{f.id === 'JNS-002' ? 3 : 1}</span>
+                <span className="pill ok" style={{ height: 18 }}>
+                  patched
+                </span>
+              </div>
+            </div>
+          </Section>
+
+          {verified && (
+            <Section label="Verification result">
+              <div style={{ display: 'flex', gap: 10, padding: '6px 0' }}>
+                <span style={{ color: 'var(--ok)', fontSize: 20 }}>✓</span>
+                <div>
+                  <div style={{ fontWeight: 600, color: 'var(--ok)', fontSize: 13 }}>Patch confirmed effective</div>
+                  <div
+                    style={{ fontSize: 12.5, color: 'var(--fg-dim)', marginTop: 3, lineHeight: 1.5 }}
+                  >
+                    Janus_Red re-ran the PoC on the patched build and the exploit failed. Bypass attempts also failed.{' '}
+                    {f.id} marked RESOLVED.
+                  </div>
+                </div>
+              </div>
+            </Section>
+          )}
+        </div>
+
+        <div style={{ overflow: 'auto', padding: 16, display: 'flex', flexDirection: 'column', gap: 12 }}>
+          <div style={{ display: 'flex', gap: 10 }}>
+            <div style={{ flex: 1, display: 'flex', gap: 6, alignItems: 'center' }}>
+              <span className="mono" style={{ fontSize: 11, color: 'var(--fg-dim)' }}>
+                before
+              </span>
+              <span className="mono" style={{ fontSize: 11.5, color: 'var(--fg-mid)' }}>
+                {f.file.split('/').pop()} @ a4c91f2
+              </span>
+            </div>
+            <div style={{ flex: 1, display: 'flex', gap: 6, alignItems: 'center' }}>
+              <span className="mono" style={{ fontSize: 11, color: 'var(--fg-dim)' }}>
+                after
+              </span>
+              <span className="mono" style={{ fontSize: 11.5, color: 'var(--ok)' }}>
+                {f.file.split('/').pop()} @ patched
+              </span>
+            </div>
+          </div>
+          <DiffBlock before={f.vulnCode} after={f.patchedCode} />
+        </div>
+      </div>
+    </div>
+  );
+}
