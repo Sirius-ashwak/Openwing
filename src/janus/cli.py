@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from pathlib import Path
@@ -12,6 +13,12 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.theme import Theme
 
+from janus.github_fetcher import (
+    GitHubURLError,
+    cleanup_clone,
+    clone_repo,
+    is_github_url,
+)
 from janus.graph import JanusResult, run_janus_on_file
 from janus.runner import dumps_results, janus_result_to_jsonable, sweep_python_tree
 
@@ -171,100 +178,119 @@ def run_cmd(
         os.environ["JANUS_SEMGREP_ENABLED"] = "1"
         os.environ["JANUS_SEMGREP_RULES"] = semgrep_rules
 
-    target = Path(path)
-    if not target.exists():
-        console.print(f"[bad]Missing path[/bad]: {target}", style="bad")
-        raise typer.Exit(code=1)
+    cloned_dir: Path | None = None
 
-    if target.is_file():
-        if target.suffix != ".py":
-            console.print("[bad]Individual targets must end with `.py`.[/bad]", style="bad")
+    if is_github_url(path):
+        try:
+            console.print(f"[info]Cloning[/info] {path}…")
+            cloned_dir = asyncio.run(clone_repo(path, timeout_s=120))
+            console.print(f"[ok]Clone complete →[/ok] {cloned_dir}")
+            target = cloned_dir
+        except GitHubURLError as exc:
+            console.print(f"[bad]{exc}[/bad]", style="bad")
+            raise typer.Exit(code=1)
+        except (TimeoutError, RuntimeError) as exc:
+            console.print(f"[bad]Clone failed:[/bad] {exc}", style="bad")
+            raise typer.Exit(code=1)
+    else:
+        target = Path(path)
+        if not target.exists():
+            console.print(f"[bad]Missing path[/bad]: {target}", style="bad")
             raise typer.Exit(code=1)
 
-        bundle = Panel.fit(f"[info]Target file[/info] {target.resolve()}", style="info")
-        console.print(bundle)
+    try:
+        if target.is_file():
+            if target.suffix != ".py":
+                console.print("[bad]Individual targets must end with `.py`.[/bad]", style="bad")
+                raise typer.Exit(code=1)
 
-        result = run_janus_on_file(
-            target.resolve(),
-            max_patch_cycles=max_cycles,
-            dry_run=dry_run,
-            backup_before_write=backup,
-            max_syntax_attempts_per_patch=syntax_tries,
-            enable_semgrep=semgrep,
-        )
+            bundle = Panel.fit(f"[info]Target file[/info] {target.resolve()}", style="info")
+            console.print(bundle)
 
-        results = [result]
-
-        if format_out == "sarif":
-            _emit_sarif(results, output)
-        elif format_out == "json":
-            console.print(
-                json.dumps([janus_result_to_jsonable(result)], ensure_ascii=False, indent=2)
+            result = run_janus_on_file(
+                target.resolve(),
+                max_patch_cycles=max_cycles,
+                dry_run=dry_run,
+                backup_before_write=backup,
+                max_syntax_attempts_per_patch=syntax_tries,
+                enable_semgrep=semgrep,
             )
-        else:
-            _render_human(result)
 
-        if sbom:
-            _emit_sbom([target.resolve()], sbom)
+            results = [result]
 
-        raise typer.Exit(code=0 if result.ok else 2)
-
-    if target.is_dir():
-        rows = sweep_python_tree(
-            target.resolve(),
-            max_files=max_files,
-            max_patch_cycles=max_cycles,
-            dry_run=dry_run,
-            backup_before_write=backup,
-            syntax_attempt_budget=syntax_tries,
-            concurrency=concurrency,
-        )
-
-        bundle = Panel.fit(
-            f"[info]Directory sweep[/info] {target.resolve()} — capped at {max_files} modules"
-            + (f" — concurrency {concurrency}" if concurrency > 1 else ""),
-            style="info",
-        )
-        console.print(bundle)
-
-        if not rows:
-            console.print("[warn]No Python modules discovered beneath that path (after filters).[/warn]")
-            if format_out == "json":
-                console.print("[]")
-            raise typer.Exit(code=0)
-
-        if format_out == "sarif":
-            _emit_sarif(rows, output)
-        elif format_out == "json":
-            console.print(dumps_results(rows, pretty=True))
-        else:
-            table = Table(show_header=True, header_style="bold magenta")
-            table.add_column("Target", overflow="ellipsis", max_width=60)
-            table.add_column("Status", justify="center")
-            table.add_column("Cycles", justify="right")
-            table.add_column("Summary", overflow="ellipsis", max_width=45)
-
-            for entry in rows:
-                table.add_row(
-                    entry.target,
-                    "PASS" if entry.ok else "FAIL",
-                    str(entry.patch_cycles),
-                    entry.message.splitlines()[0][:200],
+            if format_out == "sarif":
+                _emit_sarif(results, output)
+            elif format_out == "json":
+                console.print(
+                    json.dumps([janus_result_to_jsonable(result)], ensure_ascii=False, indent=2)
                 )
-            console.print(table)
+            else:
+                _render_human(result)
 
-            failures = sum(1 for row in rows if not row.ok)
-            console.print(f"[info]Completed[/info] {len(rows)} surfaces — failures: {failures}")
+            if sbom:
+                _emit_sbom([target.resolve()], sbom)
 
-        if sbom:
-            from janus.discovery import iter_python_files
-            scanned_files = iter_python_files(target.resolve(), max_files=max_files)
-            _emit_sbom(scanned_files, sbom)
+            raise typer.Exit(code=0 if result.ok else 2)
 
-        raise typer.Exit(code=0 if all(row.ok for row in rows) else 3)
+        if target.is_dir():
+            rows = sweep_python_tree(
+                target.resolve(),
+                max_files=max_files,
+                max_patch_cycles=max_cycles,
+                dry_run=dry_run,
+                backup_before_write=backup,
+                syntax_attempt_budget=syntax_tries,
+                concurrency=concurrency,
+            )
 
-    console.print("[bad]Unsupported path type (expected file or directory).[/bad]")
-    raise typer.Exit(code=1)
+            bundle = Panel.fit(
+                f"[info]Directory sweep[/info] {target.resolve()} — capped at {max_files} modules"
+                + (f" — concurrency {concurrency}" if concurrency > 1 else ""),
+                style="info",
+            )
+            console.print(bundle)
+
+            if not rows:
+                console.print("[warn]No Python modules discovered beneath that path (after filters).[/warn]")
+                if format_out == "json":
+                    console.print("[]")
+                raise typer.Exit(code=0)
+
+            if format_out == "sarif":
+                _emit_sarif(rows, output)
+            elif format_out == "json":
+                console.print(dumps_results(rows, pretty=True))
+            else:
+                table = Table(show_header=True, header_style="bold magenta")
+                table.add_column("Target", overflow="ellipsis", max_width=60)
+                table.add_column("Status", justify="center")
+                table.add_column("Cycles", justify="right")
+                table.add_column("Summary", overflow="ellipsis", max_width=45)
+
+                for entry in rows:
+                    table.add_row(
+                        entry.target,
+                        "PASS" if entry.ok else "FAIL",
+                        str(entry.patch_cycles),
+                        entry.message.splitlines()[0][:200],
+                    )
+                console.print(table)
+
+                failures = sum(1 for row in rows if not row.ok)
+                console.print(f"[info]Completed[/info] {len(rows)} surfaces — failures: {failures}")
+
+            if sbom:
+                from janus.discovery import iter_python_files
+                scanned_files = iter_python_files(target.resolve(), max_files=max_files)
+                _emit_sbom(scanned_files, sbom)
+
+            raise typer.Exit(code=0 if all(row.ok for row in rows) else 3)
+
+        console.print("[bad]Unsupported path type (expected file or directory).[/bad]")
+        raise typer.Exit(code=1)
+    finally:
+        if cloned_dir is not None:
+            cleanup_clone(cloned_dir)
 
 @app.command("serve")
 def serve_cmd(
