@@ -24,6 +24,7 @@ yarn-error.log*
 # Builds
 dist/
 build/
+*.tsbuildinfo
 .DS_Store
 
 # IDEs/AI
