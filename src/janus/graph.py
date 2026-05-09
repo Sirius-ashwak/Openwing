@@ -177,6 +177,7 @@ def _verify_node(state: JanusGraphState) -> dict[str, Any]:
         )
         _emit("system", f"Residual heuristic hints: {len(hints)} pattern(s) — review recommended", kind="warn")
 
+    _emit("red", "Verification passed — patch holds.", kind="verify", file=str(base["file_path"]))
     _emit("system", "✓ Run complete — all findings resolved.", kind="ok")
     accumulated = sorted(set(base.get("static_warnings") or []) | set(hints))
 
@@ -221,6 +222,15 @@ def _blue_node(state: JanusGraphState) -> dict[str, Any]:
             compile_check(temp, filename_hint=str(base["file_path"]) + "<janus-remedy>")
             patched = temp
             _emit("blue", f"Patch valid (attempt {attempt + 1}) — syntax gate passed.", kind="ok")
+            _emit(
+                "blue",
+                "Patch ready",
+                kind="patch",
+                file=str(base["file_path"]),
+                cwe=report.vulnerability_type,
+                original_source=base["source"],
+                patched_source=patched,
+            )
             break
         except SyntaxError as exc:
             repair_hint = (

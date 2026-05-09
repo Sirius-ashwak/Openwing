@@ -42,6 +42,12 @@ class RunRecord:
     files_patched: int = 0
     patch_cycles_total: int = 0
 
+    # Per-file sweep lanes (built after scan completes)
+    sweep_files: list[dict[str, Any]] = field(default_factory=list)
+
+    # Repo metadata (populated for github URL targets)
+    repo_meta: dict[str, Any] = field(default_factory=dict)
+
     # Temp directory for cloned repos (cleaned up after run)
     tmp_dir: Path | None = None
 

@@ -116,50 +116,269 @@ def _close_sse(rec: RunRecord, loop: asyncio.AbstractEventLoop) -> None:
 
 # ── Result → finding extractor ────────────────────────────────────────────
 
+# CWE → frontend display metadata. Drives severity, CVSS heuristic, title, impact.
+_CWE_META: dict[str, dict[str, Any]] = {
+    "sql_injection": {
+        "severity": "critical",
+        "cvss": 9.1,
+        "title": "SQL Injection",
+        "cwe": "CWE-89",
+        "impact": [
+            "Attacker can read or modify any row in the database via crafted input.",
+            "Authentication can be bypassed by injecting OR clauses.",
+            "Confidentiality and integrity of all stored data are at risk.",
+        ],
+    },
+    "command_injection": {
+        "severity": "critical",
+        "cvss": 9.8,
+        "title": "OS Command Injection",
+        "cwe": "CWE-78",
+        "impact": ["Arbitrary OS command execution under the server process identity."],
+    },
+    "ssrf": {
+        "severity": "critical",
+        "cvss": 9.0,
+        "title": "Server-Side Request Forgery",
+        "cwe": "CWE-918",
+        "impact": [
+            "Server can be coerced into requesting internal endpoints (cloud metadata, RFC1918).",
+            "Credentials in IMDS are exfiltrable on most cloud providers.",
+        ],
+    },
+    "rce": {
+        "severity": "critical",
+        "cvss": 9.8,
+        "title": "Remote Code Execution",
+        "cwe": "CWE-94",
+        "impact": ["Attacker-controlled code runs in the application process."],
+    },
+    "deserialization": {
+        "severity": "critical",
+        "cvss": 9.0,
+        "title": "Insecure Deserialization",
+        "cwe": "CWE-502",
+        "impact": ["Untrusted input deserialized — gadget chains can lead to RCE."],
+    },
+    "xss": {
+        "severity": "high",
+        "cvss": 7.4,
+        "title": "Cross-Site Scripting",
+        "cwe": "CWE-79",
+        "impact": ["Session hijack, credential theft, persistent UI takeover."],
+    },
+    "path_traversal": {
+        "severity": "high",
+        "cvss": 7.5,
+        "title": "Path Traversal",
+        "cwe": "CWE-22",
+        "impact": ["Read arbitrary files outside the intended directory."],
+    },
+    "auth_bypass": {
+        "severity": "high",
+        "cvss": 8.1,
+        "title": "Authentication Bypass",
+        "cwe": "CWE-287",
+        "impact": ["Privileged routes accessible without valid credentials."],
+    },
+    "idor": {
+        "severity": "high",
+        "cvss": 7.7,
+        "title": "Insecure Direct Object Reference",
+        "cwe": "CWE-639",
+        "impact": ["One user can access another's records by changing an identifier."],
+    },
+}
+
+_DEFAULT_META: dict[str, Any] = {
+    "severity": "medium",
+    "cvss": 5.5,
+    "title": "Vulnerability detected",
+    "cwe": "CWE-Other",
+    "impact": ["Manual review recommended."],
+}
+
+
+def _normalize_cwe(raw: str) -> str:
+    return (raw or "").strip().lower().replace("-", "_").replace(" ", "_")
+
+
+def _meta_for(raw_cwe: str) -> dict[str, Any]:
+    key = _normalize_cwe(raw_cwe)
+    if key in _CWE_META:
+        return _CWE_META[key]
+    if "sqli" in key or "sql" in key and "inject" in key:
+        return _CWE_META["sql_injection"]
+    if "ssrf" in key:
+        return _CWE_META["ssrf"]
+    if "xss" in key or "cross_site" in key:
+        return _CWE_META["xss"]
+    if "path" in key or "lfi" in key or "traversal" in key:
+        return _CWE_META["path_traversal"]
+    if "rce" in key or "code_exec" in key:
+        return _CWE_META["rce"]
+    if "deserial" in key:
+        return _CWE_META["deserialization"]
+    if "command" in key and "inject" in key:
+        return _CWE_META["command_injection"]
+    if "auth" in key and "bypass" in key:
+        return _CWE_META["auth_bypass"]
+    if "idor" in key:
+        return _CWE_META["idor"]
+    return _DEFAULT_META
+
+
+def _find_snippet_line(snippet: str, source: str) -> int:
+    """Best-effort: find the 1-indexed line of `snippet` inside `source`."""
+    if not snippet or not source:
+        return 1
+    needle = snippet.strip().splitlines()[0].strip()
+    if not needle:
+        return 1
+    for idx, line in enumerate(source.splitlines(), start=1):
+        if needle in line:
+            return idx
+    return 1
+
+
 def _extract_findings(
     events: list[dict],
     results: list[JanusResult],
     run_id: str,
 ) -> list[dict]:
-    """Build finding records from trace events (which capture every Red verdict).
-
-    Reading from result.last_report would miss findings that were detected and
-    then patched — since the final scan is clean, last_report.is_secure_report()
-    returns True and the original vuln is invisible. The trace stream preserves
-    the FIRST detection per file, which is what we want.
+    """Build findings keyed off red 'finding' events, enriched with patch + verify
+    timestamps and the before/after source captured by graph.py.
     """
-    # Map file path → final per-file result (for patched/cycles status)
     by_file: dict[str, JanusResult] = {}
     for r in results:
         if r.target:
             by_file[r.target] = r
 
+    # Index trace events by file for patch/verify lookup
+    patch_events: dict[str, dict] = {}   # file → most recent patch event
+    verify_events: dict[str, dict] = {}  # file → most recent verify event
+    for ev in events:
+        f = ev.get("file") or ""
+        if not f:
+            continue
+        if ev.get("kind") == "patch":
+            patch_events[f] = ev
+        elif ev.get("kind") == "verify":
+            verify_events[f] = ev
+
     findings: list[dict] = []
-    seen_files: set[str] = set()  # only emit the first detection per file
+    seen_files: set[str] = set()
 
     for ev in events:
         if ev.get("kind") != "finding" or ev.get("agent") != "red":
             continue
         fpath = ev.get("file", "")
-        if fpath in seen_files:
+        if not fpath or fpath in seen_files:
             continue
         seen_files.add(fpath)
 
         result = by_file.get(fpath)
-        findings.append({
-            "id": f"{run_id[:8]}-{len(findings):03d}",
+        meta = _meta_for(ev.get("cwe", ""))
+        snippet = ev.get("snippet", "")
+        payload = ev.get("payload", "")
+
+        patch_ev = patch_events.get(fpath)
+        verify_ev = verify_events.get(fpath)
+        original_source = (patch_ev or {}).get("original_source") or snippet
+        patched_source = (patch_ev or {}).get("patched_source") or ""
+
+        line_no = _find_snippet_line(snippet, original_source)
+        file_basename = Path(fpath).name
+
+        finding = {
+            "id": f"JNS-{len(findings) + 1:03d}",
             "run_id": run_id,
             "file": fpath,
+            "line": line_no,
+            "title": f"{meta['title']} in {file_basename}",
             "vulnerability_type": ev.get("cwe", "unknown"),
-            "snippet": ev.get("snippet", ""),
-            "payload": ev.get("payload", ""),
-            "patched": bool(result and result.ok and result.patch_cycles > 0),
+            "cwe": meta["cwe"],
+            "severity": meta["severity"],
+            "cvss": meta["cvss"],
+            "description": (
+                f"{meta['title']} confirmed by Janus_Red. "
+                f"Trigger snippet: {snippet[:120]}…"
+                if len(snippet) > 120
+                else f"{meta['title']} confirmed by Janus_Red. Trigger snippet: {snippet}"
+            ),
+            "impact": meta["impact"],
+            "vulnCode": original_source,
+            "patchedCode": patched_source,
+            "snippet": snippet,
+            "payload": payload,
+            "poc": payload if payload else None,
+            "triage": "true-positive",
+            "patched": bool(patch_ev) or bool(result and result.ok and result.patch_cycles > 0),
             "patch_cycles": result.patch_cycles if result else 0,
             "static_warnings": result.static_warnings if result else [],
             "dry_run": result.dry_run if result else False,
-        })
+            "discoveredAt": int(ev.get("t", 0)),
+            "patchedAt": int(patch_ev["t"]) if patch_ev else None,
+            "verifiedAt": int(verify_ev["t"]) if verify_ev else None,
+        }
+        findings.append(finding)
 
     return findings
+
+
+# ── Per-file sweep lane builder ───────────────────────────────────────────
+
+def _build_sweep_lanes(
+    py_files: list[Path],
+    events: list[dict],
+    results: list[JanusResult],
+) -> list[dict]:
+    """Build per-file sweep lane data for /api/sweep — one row per file."""
+    by_file: dict[str, JanusResult] = {r.target: r for r in results if r.target}
+
+    # Find first finding-event timestamp per file
+    finding_t: dict[str, int] = {}
+    for ev in events:
+        if ev.get("kind") != "finding":
+            continue
+        f = ev.get("file") or ""
+        if f and f not in finding_t:
+            finding_t[f] = int(ev.get("t", 0))
+
+    # Find scan-complete timestamp per file (last "Scanning" → next system event)
+    last_t = max((int(ev.get("t", 0)) for ev in events), default=0)
+
+    lanes: list[dict] = []
+    for fpath in py_files:
+        path_str = str(fpath)
+        result = by_file.get(path_str)
+        loc = 0
+        try:
+            loc = sum(1 for _ in fpath.read_text(encoding="utf-8", errors="ignore").splitlines())
+        except OSError:
+            loc = 0
+
+        if path_str in finding_t:
+            state = "critical"
+            findings_count = 1
+            t_ms = finding_t[path_str]
+        elif result and result.ok:
+            state = "clean"
+            findings_count = 0
+            t_ms = last_t
+        else:
+            state = "clean"
+            findings_count = 0
+            t_ms = last_t
+
+        lanes.append({
+            "path": fpath.name,
+            "loc": loc,
+            "time": t_ms,
+            "state": state,
+            "findings": findings_count,
+        })
+    return lanes
 
 
 # ── Background scan task ──────────────────────────────────────────────────
@@ -182,7 +401,17 @@ async def _execute_run(rec: RunRecord, body: CreateRunRequest) -> None:
             try:
                 tmp_dir = await clone_repo(target, timeout_s=120)
                 scan_root = tmp_dir
-                store.update(rec.run_id, tmp_dir=tmp_dir)
+                from janus.github_fetcher import parse_github_url
+                owner, repo_name = parse_github_url(target)
+                repo_meta = {
+                    "url": f"github.com/{owner}/{repo_name}",
+                    "name": repo_name,
+                    "owner": owner,
+                    "branch": "main",
+                    "commit": "HEAD",
+                    "language": "Python",
+                }
+                store.update(rec.run_id, tmp_dir=tmp_dir, repo_meta=repo_meta)
                 emit({"agent": "system", "line": f"Clone complete → {tmp_dir}"})
             except (GitHubURLError, TimeoutError, RuntimeError) as exc:
                 raise RuntimeError(f"Repository clone failed: {exc}") from exc
@@ -192,6 +421,14 @@ async def _execute_run(rec: RunRecord, body: CreateRunRequest) -> None:
             if not p.exists():
                 raise FileNotFoundError(f"Path not found: {target!r}")
             scan_root = p
+            store.update(rec.run_id, repo_meta={
+                "url": str(p),
+                "name": p.name,
+                "owner": "local",
+                "branch": "—",
+                "commit": "—",
+                "language": "Python",
+            })
 
         # ── Discover files ────────────────────────────────────────────────
         if scan_root.is_file():
@@ -224,6 +461,7 @@ async def _execute_run(rec: RunRecord, body: CreateRunRequest) -> None:
         patched_count = sum(1 for r in results if r.ok and r.patch_cycles > 0)
         total_cycles = sum(r.patch_cycles for r in results)
         findings = _extract_findings(rec.events, results, rec.run_id)
+        sweep_lanes = _build_sweep_lanes(py_files, rec.events, results)
 
         summary = {
             "files_scanned": len(results),
@@ -247,6 +485,7 @@ async def _execute_run(rec: RunRecord, body: CreateRunRequest) -> None:
             status="done",
             finished_at=time.time(),
             findings=findings,
+            sweep_files=sweep_lanes,
             files_patched=patched_count,
             patch_cycles_total=total_cycles,
             result=summary,
@@ -435,33 +674,51 @@ async def system_status() -> dict:
     }
 
 
-# ── Legacy GET endpoints (kept for frontend compatibility) ────────────────
+# ── Legacy GET endpoints (frontend convenience views) ────────────────────
+
+def _format_when(epoch: float | None) -> str:
+    if epoch is None:
+        return "—"
+    delta = time.time() - epoch
+    if delta < 60:
+        return f"{int(delta)}s ago"
+    if delta < 3600:
+        return f"{int(delta // 60)}m ago"
+    if delta < 86400:
+        return f"{int(delta // 3600)}h ago"
+    return f"{int(delta // 86400)}d ago"
+
+
+def _history_status(rec: RunRecord) -> str:
+    if rec.status == "error":
+        return "failed"
+    if rec.status == "cancelled":
+        return "failed"
+    if rec.status in ("queued", "running"):
+        return "partial"
+    if rec.files_patched > 0:
+        return "resolved"
+    if len(rec.findings) == 0:
+        return "clean"
+    return "partial"
+
 
 @app.get("/api/repo")
 async def get_repo() -> dict:
     runs = store.list_recent(1)
-    if runs and runs[0].target:
-        return {
-            "url": runs[0].target.replace("https://", "").replace("http://", ""),
-            "name": Path(runs[0].target).name,
-            "owner": "",
-            "branch": "main",
-            "commit": "–",
-            "language": "Python",
-            "files": runs[0].files_scanned,
-            "loc": 0,
-            "size": "–",
-        }
+    rec = runs[0] if runs else None
+    meta = (rec.repo_meta if rec else {}) or {}
+    total_loc = sum(f.get("loc", 0) for f in (rec.sweep_files if rec else []))
     return {
-        "url": "github.com/openwing-labs/vuln-flask-app",
-        "name": "vuln-flask-app",
-        "owner": "openwing-labs",
-        "branch": "main",
-        "commit": "–",
-        "language": "Python",
-        "files": 0,
-        "loc": 0,
-        "size": "–",
+        "url": meta.get("url", ""),
+        "name": meta.get("name", ""),
+        "owner": meta.get("owner", ""),
+        "branch": meta.get("branch", "—"),
+        "commit": meta.get("commit", "—"),
+        "language": meta.get("language", "Python"),
+        "files": rec.files_scanned if rec else 0,
+        "loc": total_loc,
+        "size": "—",
     }
 
 
@@ -471,15 +728,17 @@ async def get_filetree() -> list:
     if not runs:
         return []
     rec = runs[0]
-    return [
-        {
-            "path": f["file"],
-            "loc": 0,
-            "status": "critical" if not f["patched"] else "clean",
-            "vulnerability_type": f["vulnerability_type"],
-        }
-        for f in rec.findings
-    ]
+    flagged_files = {f["file"]: f for f in rec.findings}
+    out: list[dict] = []
+    for entry in rec.sweep_files:
+        path = entry.get("path", "")
+        is_flagged = any(path == Path(k).name for k in flagged_files)
+        out.append({
+            "path": path,
+            "loc": entry.get("loc", 0),
+            "status": "critical" if entry.get("state") == "critical" or is_flagged else "clean",
+        })
+    return out
 
 
 @app.get("/api/sweep")
@@ -487,12 +746,31 @@ async def get_sweep() -> list:
     runs = store.list_recent(1)
     if not runs:
         return []
-    return [r.to_dict() for r in store.list_recent(20)]
+    return runs[0].sweep_files
 
 
 @app.get("/api/history")
 async def get_history() -> list:
-    return [r.to_dict() for r in store.list_recent(50)]
+    out: list[dict] = []
+    for rec in store.list_recent(50):
+        meta = rec.repo_meta or {}
+        repo_label = meta.get("url") or rec.target or "—"
+        if rec.started_at and rec.finished_at:
+            dur_s = rec.finished_at - rec.started_at
+            dur = f"{dur_s:.1f}s"
+        else:
+            dur = "—"
+        out.append({
+            "id": rec.run_id,
+            "repo": repo_label,
+            "when": _format_when(rec.started_at or rec.created_at),
+            "status": _history_status(rec),
+            "findings": len(rec.findings),
+            "fixed": rec.files_patched,
+            "dur": dur,
+            "cost": "$0.00",  # cost tracking not implemented yet
+        })
+    return out
 
 
 @app.get("/api/trace")
@@ -504,8 +782,24 @@ async def get_trace(run_id: str | None = None) -> list:
     return runs[0].events if runs else []
 
 
-# ── Static frontend ───────────────────────────────────────────────────────
+@app.get("/api/findings")
+async def get_findings_default() -> list:
+    """Convenience: latest run's findings (frontend prefetch)."""
+    runs = store.list_recent(1)
+    return runs[0].findings if runs else []
 
-_frontend_dir = Path(__file__).resolve().parent.parent.parent / "frontend"
-if _frontend_dir.exists():
-    app.mount("/", StaticFiles(directory=str(_frontend_dir), html=True), name="frontend")
+
+# ── Static frontend ───────────────────────────────────────────────────────
+# Production: serve the Vite-built bundle from frontend/dist/.
+# Development: run `npm run dev` in frontend/ — Vite proxies /api/* here.
+
+_frontend_root = Path(__file__).resolve().parent.parent.parent / "frontend"
+_frontend_dist = _frontend_root / "dist"
+
+if _frontend_dist.exists():
+    app.mount("/", StaticFiles(directory=str(_frontend_dist), html=True), name="frontend")
+else:
+    logger.warning(
+        "frontend/dist/ not found — run `npm install && npm run build` in frontend/, "
+        "or use `npm run dev` for live reload (proxies /api to this server)."
+    )
